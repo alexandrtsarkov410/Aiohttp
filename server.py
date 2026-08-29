@@ -4,15 +4,21 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from models import Session, Advertisement, engine, init_orm
 from schema import AdCreateSchema, AdUpdateSchema
+import pydantic
 
 
-def validate(incoming_json: dict, schema: type[AdCreateSchema | AdUpdateSchema]):
+def get_http_error(error_class, message):
+    return error_class(text = json.dumps({"status": "error", "message": message}),
+                        content_type = "application/json"
+                        )
+
+
+def validate(incoming_json: dict, schema: type[AdCreateSchema | AdUpdateSchema])-> tuple[bool, dict | None, list[str] | None]:
     try:
-        return schema(**incoming_json).model_dump(exclude_unset=True)
-    except ValueError as e:
-        raise web.HTTPBadRequest(text=str(e))
-
-app = web.Application()
+        return True, schema(**incoming_json).model_dump(exclude_unset=True), None
+    except pydantic.ValidationError as err:
+        errors = [e["msg"] for e in err.errors()]
+        return False, None, errors
 
 
 async def orm_context(app: web.Application):
@@ -33,13 +39,9 @@ async def session_middleware(request: web.Request, handler):
         return response
 
 
+app = web.Application()
 app.cleanup_ctx.append(orm_context)
 app.middlewares.append(session_middleware)
-
-def get_http_error(error_class, message):
-    return error_class(text = json.dumps({"status": "error", "message": message}),
-                        content_type = "application/json"
-                        )
 
 
 async def get_advertisement(session: AsyncSession, advertisement_id: int) -> Advertisement:
@@ -73,15 +75,33 @@ class AdvertisementView(web.View):
         return web.json_response (advertisement.json)
 
     async def post(self):
-        json_data = await self.request.json()
+        try:
+            json_data = await self.request.json()
+        except Exception:
+            return get_http_error(400, "Invalid JSON")
+        is_valid, clean_data, errors = validate(json_data, AdCreateSchema)
+        if not is_valid:
+            # Возвращаем все ошибки сразу
+            return get_http_error(400, errors)
         advertisement = Advertisement(**json_data)
         await add_advertisement(self.session, advertisement)
         return web.json_response(advertisement.json)
 
     async def patch(self):
-        json_data = await self.request.json()
-        advertisement = await get_advertisement(self.session, self.advertisement_id)
-        for field, value in json_data.items():
+        try:
+            json_data = await self.request.json()
+        except Exception:
+            return get_http_error(400, "Invalid JSON")
+        try:
+            advertisement = await get_advertisement(self.session, self.advertisement_id)
+        except web.HTTPException as e:
+            return e
+        is_valid, updates, errors = validate(json_data, AdUpdateSchema)
+        if not is_valid:
+            return get_http_error(400, errors)
+        if not updates:
+            return web.json_response({"message": "No changes"}, status=200)
+        for field, value in updates.items():
             setattr(advertisement, field, value)
         await self.session.commit()
         return web.json_response(advertisement.json)
